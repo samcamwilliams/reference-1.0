@@ -54,10 +54,14 @@
 
 %% @doc Default key lookup falls through to the latest incarnation of the
 %% reference's keys and values, so that `GET /ReferenceID/Key' resolves the
-%% mutable data underlying the reference.
+%% mutable data underlying the reference. The `excludes' list keeps the
+%% message-manipulation keys (`set', `keys', etc.) bound to `message@1.0' so
+%% that operations like setting the `~reference@1.0' device on a path are not
+%% captured by `get/4' (which would otherwise trigger a network refresh).
 info() ->
     #{
-        default => fun get/4
+        default => fun get/4,
+        excludes => [<<"keys">>, <<"set">>, <<"set-path">>, <<"remove">>]
     }.
 
 %%%-------------------------------------------------------------------
@@ -613,15 +617,29 @@ name_resolves_through_reference_test() ->
     ResolverPath = <<RefID/binary, "~reference@1.0/compute">>,
     {ok, ComputeRes} = hb_ao:resolve(ResolverPath, OptsW),
     ?event({direct_compute, ComputeRes}),
-    ?assertEqual(#{ <<"foo">> => <<"value-1">> }, ComputeRes),
+    ?assertEqual(<<"value-1">>, hb_ao:get(<<"foo">>, ComputeRes, OptsW)),
     {ok, DirectFoo} =
         hb_ao:resolve(
             <<ResolverPath/binary, "/foo">>, OptsW),
     ?event({direct_foo, DirectFoo}),
     ?assertEqual(<<"value-1">>, DirectFoo),
     %% 2b. Start a node with a name-resolver pointing at the reference's
-    %%     `compute' path, so lookups never reach the gateway.
-    NodeOpts = OptsW#{ <<"name-resolvers">> => [ResolverPath] },
+    %%     `compute' path, so lookups never reach the gateway. Bind an
+    %%     ephemeral port (`0') so the test never contends for the default.
+    %%     A reference is mutable, but its resolution path is constant, so the
+    %%     node's default `cache-control: always' would pin the first value and
+    %%     mask later updates. Override `http-extra-opts' so reads stay fresh --
+    %%     the required configuration for any node serving mutable references.
+    NodeOpts =
+        OptsW#{
+            <<"name-resolvers">> => [ResolverPath],
+            <<"port">> => 0,
+            <<"http-extra-opts">> =>
+                #{
+                    <<"force-message">> => true,
+                    <<"cache-control">> => [<<"no-store">>, <<"no-cache">>]
+                }
+        },
     Node = hb_http_server:start_node(NodeOpts),
     %% 3a. HTTP-direct: confirm the reference device is loaded by the node.
     {ok, DirectV1} =
@@ -647,5 +665,244 @@ name_resolves_through_reference_test() ->
     %% 5. Resolve `foo' again -- name-resolvers unchanged, value is new.
     {ok, V2} = hb_http:get(Node, <<"/~name@1.0/foo&load=false">>, NodeOpts),
     ?assertEqual(<<"value-2">>, V2).
+
+%%%-------------------------------------------------------------------
+%%% Reference-set tests
+%%%
+%%% A reference *set* is a `~reference@1.0' reference whose value is a
+%%% directory mapping a (large) number of names to *pointers* at other,
+%%% downstream references. A pointer is the minimal handle
+%%% `#{ device => reference@1.0, reference-id => DownstreamID }'. Because
+%%% `reference_id/2' honours an explicit `reference-id', and AO-Core derives
+%%% each path step's device from the current message, the chain
+%%% `SetID~reference@1.0/compute/<name>/compute/<key>' flows from the
+%%% directory into the downstream reference's current value. Each downstream
+%%% reference is governed by its own authority and updates independently of
+%%% the directory and of every other downstream.
+%%%-------------------------------------------------------------------
+
+ref_name(I) -> <<"name-", (integer_to_binary(I))/binary>>.
+
+ref_value(I) -> <<"value-", (integer_to_binary(I))/binary>>.
+
+%% @doc The minimal downstream-reference handle stored in a set's directory.
+reference_pointer(DownstreamID) ->
+    #{
+        <<"device">> => <<"reference@1.0">>,
+        <<"reference-id">> => DownstreamID
+    }.
+
+%% @doc Commit a `~reference@1.0' init carrying the given `reference-value'.
+commit_reference(Wallet, ReferenceValue, BaseOpts) ->
+    hb_message:commit(
+        #{
+            <<"device">> => <<"reference@1.0">>,
+            <<"timestamp">> => 1,
+            <<"reference-value">> => ReferenceValue
+        },
+        opts_with_wallet(BaseOpts, Wallet)).
+
+%% @doc Create one downstream reference per `#{ Name => Value }' entry,
+%% priming each into the cache. Returns `#{ Name => DownstreamID }'.
+build_downstreams(Wallet, NameValues, BaseOpts) ->
+    Opts = opts_with_wallet(BaseOpts, Wallet),
+    maps:map(
+        fun(_Name, Value) ->
+            Init = commit_reference(Wallet, #{ <<"value">> => Value }, BaseOpts),
+            DownstreamID = hb_message:id(Init, signed, Opts),
+            prime_init(DownstreamID, Init, Opts),
+            DownstreamID
+        end,
+        NameValues).
+
+%% @doc Build a reference set over `NameValues': one downstream reference per
+%% name, plus a directory reference mapping each name to a pointer at its
+%% downstream. Returns `{SetID, #{ Name => DownstreamID }}'.
+build_reference_set(Wallet, NameValues, BaseOpts) ->
+    Opts = opts_with_wallet(BaseOpts, Wallet),
+    Downstreams = build_downstreams(Wallet, NameValues, BaseOpts),
+    Directory =
+        maps:map(
+            fun(_Name, DownstreamID) -> reference_pointer(DownstreamID) end,
+            Downstreams),
+    SetInit = commit_reference(Wallet, Directory, BaseOpts),
+    SetID = hb_message:id(SetInit, signed, Opts),
+    prime_init(SetID, SetInit, Opts),
+    {SetID, Downstreams}.
+
+%% @doc Resolve a name through the set and into its downstream reference's
+%% current `value', entirely from local cache (`compute' at each hop).
+resolve_through_set(SetID, Name, Opts) ->
+    hb_ao:resolve(
+        <<SetID/binary,
+            "~reference@1.0/compute/", Name/binary, "/compute/value">>,
+        Opts).
+
+%% @doc Read the downstream ID a directory pointer points at, loading it from
+%% the cache if it is stored as a link.
+pointer_target(Pointer, Opts) ->
+    hb_cache:ensure_loaded(
+        hb_maps:get(<<"reference-id">>, Pointer, not_found, Opts), Opts).
+
+%% @doc Scale: a set managing a large number of names, each pointing to a
+%% distinct downstream reference. Every name maps to the right downstream,
+%% and a spread of names resolves end-to-end to its downstream's value.
+reference_set_resolves_many_names_test_() ->
+    {timeout, 120, fun reference_set_resolves_many_names/0}.
+
+reference_set_resolves_many_names() ->
+    Opts = fresh_opts(),
+    Wallet = ar_wallet:new(),
+    OptsW = opts_with_wallet(Opts, Wallet),
+    N = 1000,
+    NameValues =
+        maps:from_list([ {ref_name(I), ref_value(I)} || I <- lists:seq(1, N) ]),
+    {SetID, Downstreams} = build_reference_set(Wallet, NameValues, Opts),
+    %% Directory: every one of the N names maps to the pointer at its own
+    %% downstream reference.
+    {ok, Directory} =
+        hb_ao:resolve(<<SetID/binary, "~reference@1.0/compute">>, OptsW),
+    lists:foreach(
+        fun(I) ->
+            Name = ref_name(I),
+            Pointer = hb_maps:get(Name, Directory, not_found, OptsW),
+            ?assertEqual(
+                maps:get(Name, Downstreams),
+                pointer_target(Pointer, OptsW))
+        end,
+        lists:seq(1, N)),
+    %% Transitive: a spread of names resolves through the directory into its
+    %% downstream reference's current value.
+    lists:foreach(
+        fun(I) ->
+            ?assertEqual(
+                {ok, ref_value(I)},
+                resolve_through_set(SetID, ref_name(I), OptsW))
+        end,
+        sample_indices(N)),
+    %% A name absent from the directory does not resolve.
+    ?assertNotMatch(
+        {ok, _},
+        resolve_through_set(SetID, <<"name-absent">>, OptsW)).
+
+%% @doc A spread of indices across `[1, N]' for sampling at scale.
+sample_indices(N) ->
+    lists:usort(
+        [1, 2, N - 1, N | [ max(1, (I * N) div 16) || I <- lists:seq(1, 15) ]]).
+
+%% @doc Updating one downstream reference changes only that name's resolved
+%% value; the directory and the other downstreams are untouched.
+reference_set_downstream_update_is_independent_test() ->
+    Opts = fresh_opts(),
+    Wallet = ar_wallet:new(),
+    OptsW = opts_with_wallet(Opts, Wallet),
+    NameValues = #{ <<"alice">> => <<"alice-1">>, <<"bob">> => <<"bob-1">> },
+    {SetID, Downstreams} = build_reference_set(Wallet, NameValues, Opts),
+    AliceID = maps:get(<<"alice">>, Downstreams),
+    ?assertEqual({ok, <<"alice-1">>}, resolve_through_set(SetID, <<"alice">>, OptsW)),
+    ?assertEqual({ok, <<"bob-1">>}, resolve_through_set(SetID, <<"bob">>, OptsW)),
+    %% Publish a higher-timestamp set to alice's downstream only.
+    AliceSet =
+        build_set(Wallet, AliceID, 2, #{ <<"value">> => <<"alice-2">> }, Opts),
+    _ = apply_items(AliceID, addr(Wallet), [decorate(AliceSet, 100)], OptsW),
+    %% alice reflects the update; bob and the directory are untouched.
+    ?assertEqual({ok, <<"alice-2">>}, resolve_through_set(SetID, <<"alice">>, OptsW)),
+    ?assertEqual({ok, <<"bob-1">>}, resolve_through_set(SetID, <<"bob">>, OptsW)).
+
+%% @doc Updating the *set* reference (a total directory snapshot) adds a name
+%% without minting or touching any other downstream reference.
+reference_set_directory_update_adds_name_test() ->
+    Opts = fresh_opts(),
+    Wallet = ar_wallet:new(),
+    OptsW = opts_with_wallet(Opts, Wallet),
+    {SetID, Downstreams} =
+        build_reference_set(Wallet, #{ <<"alice">> => <<"alice-1">> }, Opts),
+    %% `carol' is not in the directory yet.
+    ?assertNotMatch({ok, _}, resolve_through_set(SetID, <<"carol">>, OptsW)),
+    %% Mint carol's downstream reference and republish the directory with it.
+    CarolInit = commit_reference(Wallet, #{ <<"value">> => <<"carol-1">> }, Opts),
+    CarolID = hb_message:id(CarolInit, signed, OptsW),
+    prime_init(CarolID, CarolInit, OptsW),
+    NewDirectory =
+        #{
+            <<"alice">> => reference_pointer(maps:get(<<"alice">>, Downstreams)),
+            <<"carol">> => reference_pointer(CarolID)
+        },
+    DirectorySet = build_set(Wallet, SetID, 2, NewDirectory, Opts),
+    _ = apply_items(SetID, addr(Wallet), [decorate(DirectorySet, 100)], OptsW),
+    %% carol now resolves; alice still resolves to its (unchanged) downstream.
+    ?assertEqual({ok, <<"carol-1">>}, resolve_through_set(SetID, <<"carol">>, OptsW)),
+    ?assertEqual({ok, <<"alice-1">>}, resolve_through_set(SetID, <<"alice">>, OptsW)).
+
+%% @doc Each downstream reference is governed by its own authority: the set's
+%% (directory) owner cannot forge a downstream's value, and only the
+%% downstream's authority can update it.
+reference_set_downstream_authority_is_isolated_test() ->
+    Opts = fresh_opts(),
+    SetOwner = ar_wallet:new(),
+    AliceOwner = ar_wallet:new(),
+    OwnerOpts = opts_with_wallet(Opts, AliceOwner),
+    %% alice's downstream is governed by AliceOwner; the directory by SetOwner.
+    AliceInit = commit_reference(AliceOwner, #{ <<"value">> => <<"alice-1">> }, Opts),
+    AliceID = hb_message:id(AliceInit, signed, OwnerOpts),
+    prime_init(AliceID, AliceInit, OwnerOpts),
+    SetInit =
+        commit_reference(
+            SetOwner, #{ <<"alice">> => reference_pointer(AliceID) }, Opts),
+    SetID = hb_message:id(SetInit, signed, opts_with_wallet(Opts, SetOwner)),
+    prime_init(SetID, SetInit, opts_with_wallet(Opts, SetOwner)),
+    ?assertEqual({ok, <<"alice-1">>}, resolve_through_set(SetID, <<"alice">>, Opts)),
+    %% The directory owner cannot forge alice's value: alice's authority is
+    %% AliceOwner, not SetOwner, so the set is rejected.
+    Forged = build_set(SetOwner, AliceID, 2, #{ <<"value">> => <<"hax">> }, Opts),
+    _ = apply_items(AliceID, addr(AliceOwner), [decorate(Forged, 100)], Opts),
+    ?assertEqual({ok, <<"alice-1">>}, resolve_through_set(SetID, <<"alice">>, Opts)),
+    %% alice's own authority can update it.
+    Legit = build_set(AliceOwner, AliceID, 2, #{ <<"value">> => <<"alice-2">> }, Opts),
+    _ = apply_items(AliceID, addr(AliceOwner), [decorate(Legit, 100)], Opts),
+    ?assertEqual({ok, <<"alice-2">>}, resolve_through_set(SetID, <<"alice">>, Opts)).
+
+%% @doc End-to-end over HTTP: a node with the set as a `name-resolver'
+%% resolves names to downstream pointers (via `~name@1.0'), resolves the full
+%% chain to downstream values, and reflects a downstream update. The node
+%% overrides `http-extra-opts' so mutable reads are not pinned by the default
+%% `cache-control: always' -- the required config for serving references.
+reference_set_resolves_over_http_test() ->
+    Opts = fresh_opts(),
+    Wallet = ar_wallet:new(),
+    OptsW = opts_with_wallet(Opts, Wallet),
+    NameValues = #{ <<"alice">> => <<"alice-1">>, <<"bob">> => <<"bob-1">> },
+    {SetID, Downstreams} = build_reference_set(Wallet, NameValues, Opts),
+    AliceID = maps:get(<<"alice">>, Downstreams),
+    ResolverPath = <<SetID/binary, "~reference@1.0/compute">>,
+    NodeOpts =
+        OptsW#{
+            <<"name-resolvers">> => [ResolverPath],
+            <<"port">> => 0,
+            <<"http-extra-opts">> =>
+                #{
+                    <<"force-message">> => true,
+                    <<"cache-control">> => [<<"no-store">>, <<"no-cache">>]
+                }
+        },
+    Node = hb_http_server:start_node(NodeOpts),
+    ChainPath =
+        fun(Name) ->
+            <<"/", SetID/binary,
+                "~reference@1.0/compute/", Name/binary, "/compute/value">>
+        end,
+    %% Directory through name@1.0: alice resolves to her downstream pointer.
+    {ok, AlicePointer} =
+        hb_http:get(Node, <<"/~name@1.0/alice&load=false">>, NodeOpts),
+    ?assertEqual(AliceID, pointer_target(AlicePointer, NodeOpts)),
+    %% Full chain over HTTP into each downstream's current value.
+    ?assertEqual({ok, <<"alice-1">>}, hb_http:get(Node, ChainPath(<<"alice">>), NodeOpts)),
+    ?assertEqual({ok, <<"bob-1">>}, hb_http:get(Node, ChainPath(<<"bob">>), NodeOpts)),
+    %% A downstream update is reflected through the same path; bob is unaffected.
+    AliceSet =
+        build_set(Wallet, AliceID, 2, #{ <<"value">> => <<"alice-2">> }, Opts),
+    _ = apply_items(AliceID, addr(Wallet), [decorate(AliceSet, 100)], NodeOpts),
+    ?assertEqual({ok, <<"alice-2">>}, hb_http:get(Node, ChainPath(<<"alice">>), NodeOpts)),
+    ?assertEqual({ok, <<"bob-1">>}, hb_http:get(Node, ChainPath(<<"bob">>), NodeOpts)).
 
 -endif.
