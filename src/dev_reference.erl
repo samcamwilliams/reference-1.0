@@ -89,16 +89,20 @@ now(Base, Req, Opts) ->
         {error, _} = Err -> Err
     end.
 
-%% @doc Default key resolver. Setting `cache-control: only-if-cached' will
-%% cause the request to skip recomputing the latest message and fail if it
-%% is not already cached locally.
+%% @doc Default key resolver, so that `GET /ReferenceID/Key' yields the
+%% mutable data underlying the reference. The current value is served from the
+%% local cache (`compute'); the reference is revalidated against the gateway
+%% (`now') first only when its local view is older than the effective
+%% `max-age' (see {@link stale/3}). With the default `max-age' of `infinity'
+%% this is a pure cache read, so no explicit `compute' step is needed in a
+%% path and reads never touch the gateway.
 get(Key, Base, Req, Opts) ->
-    Path =
-        case hb_maps:get(<<"cache-control">>, Req, undefined, Opts) of
-            <<"only-if-cached">> -> <<"compute">>;
-            _ -> <<"now">>
+    Stage =
+        case stale(Base, Req, Opts) of
+            true -> <<"now">>;
+            false -> <<"compute">>
         end,
-    case hb_ao:resolve(Base, Path, Opts) of
+    case hb_ao:resolve(Base, Stage, Opts) of
         {ok, Value} ->
             hb_ao:resolve(Value, Req#{ <<"path">> => Key }, Opts);
         {error, _} = Err -> Err
@@ -172,6 +176,7 @@ refresh(Base, Opts) ->
             case fetch_reference_heads(RefID, Authority, MinBlock, Opts) of
                 {ok, Items} ->
                     apply_items(RefID, Authority, Items, Opts),
+                    ok = mark_refreshed(RefID, Opts),
                     ok;
                 {error, _} = Err -> Err
             end
@@ -412,6 +417,77 @@ decorate_with_block(Msg, Node, Edge, Opts) ->
     }.
 
 %%%-------------------------------------------------------------------
+%%% Freshness / max-age
+%%%
+%%% Each successful `refresh' records the local wall-clock second at which the
+%%% reference was last validated against the gateway. `get/4' uses that time
+%%% and an effective `max-age' to decide whether to serve the cached value
+%%% (`compute') or revalidate first (`now'). The recorded time is local cache
+%%% metadata -- not part of the reference's signed state -- and is the device's
+%%% analogue of an HTTP `Age'.
+%%%-------------------------------------------------------------------
+
+%% @doc Is the reference's local view older than the effective `max-age'? An
+%% `infinity' max-age (the default, or `cache-control: only-if-cached') is
+%% never stale; a finite max-age with no recorded refresh is always stale.
+stale(Base, Req, Opts) ->
+    case effective_max_age(Req, Opts) of
+        infinity -> false;
+        MaxAge ->
+            case reference_age(reference_id(Base, Opts), Opts) of
+                undefined -> true;
+                Age -> Age > MaxAge
+            end
+    end.
+
+%% @doc The `max-age' (seconds) to honour: the request's `max-age', else the
+%% node's `reference-max-age', else `infinity'. `cache-control: only-if-cached'
+%% forces `infinity' (resolve purely from the cache).
+effective_max_age(Req, Opts) ->
+    case hb_maps:get(<<"cache-control">>, Req, undefined, Opts) of
+        <<"only-if-cached">> -> infinity;
+        _ ->
+            case hb_maps:find(<<"max-age">>, Req, Opts) of
+                {ok, Raw} -> normalize_max_age(Raw);
+                _ ->
+                    normalize_max_age(
+                        hb_opts:get(<<"reference-max-age">>, infinity, Opts))
+            end
+    end.
+
+normalize_max_age(infinity) -> infinity;
+normalize_max_age(<<"infinity">>) -> infinity;
+normalize_max_age(MaxAge) -> ts_int(MaxAge).
+
+%% @doc Seconds since the reference was last refreshed on this node, or
+%% `undefined' if it never has been.
+reference_age(RefID, Opts) ->
+    case read_refreshed_at(RefID, Opts) of
+        undefined -> undefined;
+        RefreshedAt -> max(0, clock(Opts) - RefreshedAt)
+    end.
+
+%% @doc Record that the reference was validated against the gateway now.
+mark_refreshed(RefID, Opts) ->
+    _ = hb_store:write(
+        #{ refreshed_path(RefID) => hb_util:bin(clock(Opts)) }, Opts),
+    ok.
+
+read_refreshed_at(RefID, Opts) ->
+    case hb_store:read(refreshed_path(RefID), Opts) of
+        {ok, Bin} -> ts_int(Bin);
+        _ -> undefined
+    end.
+
+%% @doc Local wall-clock seconds, overridable via the `reference-clock' option
+%% so freshness decisions are deterministically testable.
+clock(Opts) ->
+    case hb_opts:get(<<"reference-clock">>, undefined, Opts) of
+        undefined -> erlang:system_time(second);
+        Time -> ts_int(Time)
+    end.
+
+%%%-------------------------------------------------------------------
 %%% Path helpers
 %%%-------------------------------------------------------------------
 
@@ -423,6 +499,9 @@ init_path(RefID) ->
 
 latest_path(RefID) ->
     <<(base_path(RefID))/binary, "/latest">>.
+
+refreshed_path(RefID) ->
+    <<(base_path(RefID))/binary, "/refreshed-at">>.
 
 %%%-------------------------------------------------------------------
 %%% Type helpers
@@ -613,26 +692,23 @@ name_resolves_through_reference_test() ->
             OptsW),
     RefID = hb_message:id(Init, signed, OptsW),
     prime_init(RefID, Init, OptsW),
-    %% 2a. Sanity-check the resolver path in-process before any HTTP.
-    ResolverPath = <<RefID/binary, "~reference@1.0/compute">>,
-    {ok, ComputeRes} = hb_ao:resolve(ResolverPath, OptsW),
-    ?event({direct_compute, ComputeRes}),
-    ?assertEqual(<<"value-1">>, hb_ao:get(<<"foo">>, ComputeRes, OptsW)),
-    {ok, DirectFoo} =
-        hb_ao:resolve(
-            <<ResolverPath/binary, "/foo">>, OptsW),
+    %% 2a. Sanity-check resolution in-process before any HTTP. The bare key
+    %%     path serves the reference's current value from the cache; no
+    %%     explicit `compute' step is needed.
+    RefPath = <<RefID/binary, "~reference@1.0">>,
+    {ok, DirectFoo} = hb_ao:resolve(<<RefPath/binary, "/foo">>, OptsW),
     ?event({direct_foo, DirectFoo}),
     ?assertEqual(<<"value-1">>, DirectFoo),
-    %% 2b. Start a node with a name-resolver pointing at the reference's
-    %%     `compute' path, so lookups never reach the gateway. Bind an
-    %%     ephemeral port (`0') so the test never contends for the default.
-    %%     A reference is mutable, but its resolution path is constant, so the
-    %%     node's default `cache-control: always' would pin the first value and
-    %%     mask later updates. Override `http-extra-opts' so reads stay fresh --
-    %%     the required configuration for any node serving mutable references.
+    %% 2b. Start a node with a name-resolver pointing at the reference, so
+    %%     lookups never reach the gateway. Bind an ephemeral port (`0') so the
+    %%     test never contends for the default. A reference is mutable but its
+    %%     resolution path is constant, so the node's default
+    %%     `cache-control: always' would pin the first value and mask later
+    %%     updates; override `http-extra-opts' so reads stay fresh -- the
+    %%     required configuration for any node serving mutable references.
     NodeOpts =
         OptsW#{
-            <<"name-resolvers">> => [ResolverPath],
+            <<"name-resolvers">> => [RefPath],
             <<"port">> => 0,
             <<"http-extra-opts">> =>
                 #{
@@ -645,7 +721,7 @@ name_resolves_through_reference_test() ->
     {ok, DirectV1} =
         hb_http:get(
             Node,
-            <<"/", RefID/binary, "~reference@1.0/compute/foo">>,
+            <<"/", RefID/binary, "~reference@1.0/foo">>,
             NodeOpts),
     ?assertEqual(<<"value-1">>, DirectV1),
     %% 3b. Through name@1.0 -- should return value-1.
@@ -731,11 +807,12 @@ build_reference_set(Wallet, NameValues, BaseOpts) ->
     {SetID, Downstreams}.
 
 %% @doc Resolve a name through the set and into its downstream reference's
-%% current `value', entirely from local cache (`compute' at each hop).
+%% current `value'. Each hop is the device's default key resolver, which
+%% serves from the local cache under the default `infinity' max-age -- no
+%% explicit `compute' step is required.
 resolve_through_set(SetID, Name, Opts) ->
     hb_ao:resolve(
-        <<SetID/binary,
-            "~reference@1.0/compute/", Name/binary, "/compute/value">>,
+        <<SetID/binary, "~reference@1.0/", Name/binary, "/value">>,
         Opts).
 
 %% @doc Read the downstream ID a directory pointer points at, loading it from
@@ -874,7 +951,7 @@ reference_set_resolves_over_http_test() ->
     NameValues = #{ <<"alice">> => <<"alice-1">>, <<"bob">> => <<"bob-1">> },
     {SetID, Downstreams} = build_reference_set(Wallet, NameValues, Opts),
     AliceID = maps:get(<<"alice">>, Downstreams),
-    ResolverPath = <<SetID/binary, "~reference@1.0/compute">>,
+    ResolverPath = <<SetID/binary, "~reference@1.0">>,
     NodeOpts =
         OptsW#{
             <<"name-resolvers">> => [ResolverPath],
@@ -888,8 +965,7 @@ reference_set_resolves_over_http_test() ->
     Node = hb_http_server:start_node(NodeOpts),
     ChainPath =
         fun(Name) ->
-            <<"/", SetID/binary,
-                "~reference@1.0/compute/", Name/binary, "/compute/value">>
+            <<"/", SetID/binary, "~reference@1.0/", Name/binary, "/value">>
         end,
     %% Directory through name@1.0: alice resolves to her downstream pointer.
     {ok, AlicePointer} =
@@ -904,5 +980,69 @@ reference_set_resolves_over_http_test() ->
     _ = apply_items(AliceID, addr(Wallet), [decorate(AliceSet, 100)], NodeOpts),
     ?assertEqual({ok, <<"alice-2">>}, hb_http:get(Node, ChainPath(<<"alice">>), NodeOpts)),
     ?assertEqual({ok, <<"bob-1">>}, hb_http:get(Node, ChainPath(<<"bob">>), NodeOpts)).
+
+%%%-------------------------------------------------------------------
+%%% Freshness / max-age tests
+%%%-------------------------------------------------------------------
+
+%% @doc The freshness decision honours a caller-supplied `max-age' (seconds)
+%% against the recorded refresh time: within the window the reference is fresh
+%% (served from cache), beyond it stale (revalidated). `infinity' and
+%% `only-if-cached' are never stale; an unrefreshed reference is always stale
+%% under a finite max-age.
+reference_max_age_freshness_decision_test() ->
+    Opts = fresh_opts(),
+    {RefID, Init} = build_init(ar_wallet:new(), Opts),
+    prime_init(RefID, Init, Opts),
+    ok = mark_refreshed(RefID, Opts#{ <<"reference-clock">> => 100 }),
+    Stale =
+        fun(Clock, Req) ->
+            stale(Init, Req, Opts#{ <<"reference-clock">> => Clock })
+        end,
+    ?assertNot(Stale(150, #{ <<"max-age">> => 60 })),  % age 50 =< 60
+    ?assert(Stale(200, #{ <<"max-age">> => 60 })),     % age 100 > 60
+    ?assertNot(Stale(100, #{ <<"max-age">> => 0 })),   % age 0
+    ?assert(Stale(101, #{ <<"max-age">> => 0 })),      % any elapsed time
+    ?assertNot(Stale(99999, #{ <<"max-age">> => <<"infinity">> })),
+    ?assertNot(Stale(99999, #{ <<"cache-control">> => <<"only-if-cached">> })),
+    %% A reference never refreshed on this node is stale under a finite age.
+    {RefID2, Init2} = build_init(ar_wallet:new(), Opts),
+    prime_init(RefID2, Init2, Opts),
+    ?assert(
+        stale(Init2, #{ <<"max-age">> => 60 }, Opts#{ <<"reference-clock">> => 100 })).
+
+%% @doc Absent a request `max-age', the node's `reference-max-age' option is
+%% the default; absent both, the reference is never refreshed on a read.
+reference_max_age_default_from_node_option_test() ->
+    Opts = fresh_opts(),
+    {RefID, Init} = build_init(ar_wallet:new(), Opts),
+    prime_init(RefID, Init, Opts),
+    ok = mark_refreshed(RefID, Opts#{ <<"reference-clock">> => 100 }),
+    Defaulted = Opts#{ <<"reference-max-age">> => 60 },
+    ?assertNot(stale(Init, #{}, Defaulted#{ <<"reference-clock">> => 150 })),
+    ?assert(stale(Init, #{}, Defaulted#{ <<"reference-clock">> => 200 })),
+    %% No request max-age and no node default -> infinity -> never stale.
+    ?assertNot(stale(Init, #{}, Opts#{ <<"reference-clock">> => 99999 })).
+
+%% @doc Within max-age, the value is served straight from the cache: the bare
+%% key path needs no `compute' segment, and a request `max-age' inside the
+%% window resolves without reaching the gateway (the test store has none).
+reference_max_age_serves_cache_without_gateway_test() ->
+    Opts = fresh_opts(),
+    Wallet = ar_wallet:new(),
+    OptsW = opts_with_wallet(Opts, Wallet),
+    Init = commit_reference(Wallet, #{ <<"x">> => 42 }, Opts),
+    RefID = hb_message:id(Init, signed, OptsW),
+    prime_init(RefID, Init, OptsW),
+    ok = mark_refreshed(RefID, OptsW#{ <<"reference-clock">> => 100 }),
+    %% Bare key path, default `infinity' max-age -> pure cache read.
+    ?assertEqual(
+        {ok, 42},
+        hb_ao:resolve(<<RefID/binary, "~reference@1.0/x">>, OptsW)),
+    %% Caller `max-age' within the window -> still a cache read (age 50 =< 60).
+    ?assertEqual(
+        {ok, 42},
+        get(<<"x">>, Init, #{ <<"max-age">> => 60 },
+            OptsW#{ <<"reference-clock">> => 150 })).
 
 -endif.
