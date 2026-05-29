@@ -10,3 +10,7 @@ erl_crash.dump
 rebar.lock
 hyperbeam-key.json
 wallet.json
+
+# Local working artifacts (not part of the device)
+STATUS.md
+decisions/
