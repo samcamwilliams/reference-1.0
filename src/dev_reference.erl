@@ -48,7 +48,7 @@
 %%% so the device is self-contained and does not require any HyperBEAM core
 %%% changes to operate.
 -module(dev_reference).
--export([info/0, compute/3, now/3]).
+-export([info/0, compute/3, now/3, request/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("hb/include/hb.hrl").
 
@@ -89,6 +89,18 @@ now(Base, Req, Opts) ->
         {error, _} = Err -> Err
     end.
 
+%% @doc Request hook that dereferences a reference when it is the base message
+%% selected by an earlier hook, such as `name@1.0' host resolution.
+request(_Base, Req, Opts) ->
+    maybe
+        {ok, [Ref | Rest]} ?= hb_maps:find(<<"body">>, Req, Opts),
+        <<"reference@1.0">> ?= hb_maps:get(<<"device">>, Ref, undefined, Opts),
+        {ok, Value} ?= compute(Ref, #{}, Opts),
+        {ok, Req#{ <<"body">> => [value_base(Value, Opts) | Rest] }}
+    else
+        _ -> {ok, Req}
+    end.
+
 %% @doc Default key resolver, so that `GET /ReferenceID/Key' yields the
 %% mutable data underlying the reference. The current value is served from the
 %% local cache (`compute'); the reference is revalidated against the gateway
@@ -104,9 +116,21 @@ get(Key, Base, Req, Opts) ->
         end,
     case hb_ao:resolve(Base, Stage, Opts) of
         {ok, Value} ->
-            hb_ao:resolve(Value, Req#{ <<"path">> => Key }, Opts);
+            hb_ao:resolve(value_base(Value, Opts), Req#{ <<"path">> => Key }, Opts);
         {error, _} = Err -> Err
     end.
+
+value_base(ID, Opts) when ?IS_ID(ID) ->
+    case hb_cache:read(ID, Opts) of
+        {ok, Msg} -> Msg;
+        _ -> ID
+    end;
+value_base(Link, Opts) when ?IS_LINK(Link) ->
+    try hb_cache:ensure_loaded(Link, Opts)
+    catch _:_ -> Link
+    end;
+value_base(Value, _Opts) ->
+    Value.
 
 %%%-------------------------------------------------------------------
 %%% Reference identity / current state
