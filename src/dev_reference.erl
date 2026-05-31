@@ -94,6 +94,7 @@ now(Base, Req, Opts) ->
 request(_Base, Req, Opts) ->
     maybe
         {ok, [Ref | Rest]} ?= hb_maps:find(<<"body">>, Req, Opts),
+        true ?= is_map(Ref),
         <<"reference@1.0">> ?= hb_maps:get(<<"device">>, Ref, undefined, Opts),
         {ok, Value} ?= compute(Ref, #{}, Opts),
         {ok, Req#{ <<"body">> => [value_base(Value, Opts) | Rest] }}
