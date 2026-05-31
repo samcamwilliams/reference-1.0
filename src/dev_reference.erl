@@ -48,7 +48,7 @@
 %%% so the device is self-contained and does not require any HyperBEAM core
 %%% changes to operate.
 -module(dev_reference).
--export([info/0, compute/3, now/3]).
+-export([info/0, compute/3, now/3, request/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("hb/include/hb.hrl").
 
@@ -89,6 +89,19 @@ now(Base, Req, Opts) ->
         {error, _} = Err -> Err
     end.
 
+%% @doc Request hook that dereferences a reference when it is the base message
+%% selected by an earlier hook, such as `name@1.0' host resolution.
+request(_Base, Req, Opts) ->
+    maybe
+        {ok, [Ref | Rest]} ?= hb_maps:find(<<"body">>, Req, Opts),
+        true ?= is_map(Ref),
+        <<"reference@1.0">> ?= hb_maps:get(<<"device">>, Ref, undefined, Opts),
+        {ok, Value} ?= compute(Ref, #{}, Opts),
+        {ok, Req#{ <<"body">> => [value_base(Value, Opts) | Rest] }}
+    else
+        _ -> {ok, Req}
+    end.
+
 %% @doc Default key resolver, so that `GET /ReferenceID/Key' yields the
 %% mutable data underlying the reference. The current value is served from the
 %% local cache (`compute'); the reference is revalidated against the gateway
@@ -104,9 +117,21 @@ get(Key, Base, Req, Opts) ->
         end,
     case hb_ao:resolve(Base, Stage, Opts) of
         {ok, Value} ->
-            hb_ao:resolve(Value, Req#{ <<"path">> => Key }, Opts);
+            hb_ao:resolve(value_base(Value, Opts), Req#{ <<"path">> => Key }, Opts);
         {error, _} = Err -> Err
     end.
+
+value_base(ID, Opts) when ?IS_ID(ID) ->
+    case hb_cache:read(ID, Opts) of
+        {ok, Msg} -> Msg;
+        _ -> ID
+    end;
+value_base(Link, Opts) when ?IS_LINK(Link) ->
+    try hb_cache:ensure_loaded(Link, Opts)
+    catch _:_ -> Link
+    end;
+value_base(Value, _Opts) ->
+    Value.
 
 %%%-------------------------------------------------------------------
 %%% Reference identity / current state
@@ -190,11 +215,12 @@ ensure_init_cached(Base, RefID, Opts) ->
         _ ->
             case is_init(Base, Opts) of
                 true ->
-                    {ok, _} = hb_cache:write(Base, Opts),
+                    RefOpts = reference_opts(Opts),
+                    {ok, _} = hb_cache:write(Base, RefOpts),
                     SignedID = hb_message:id(Base, signed, Opts),
                     ok =
                         hb_store:link(
-                            #{ init_path(RefID) => SignedID }, Opts);
+                            #{ init_path(RefID) => SignedID }, RefOpts);
                 false -> ok
             end
     end.
@@ -279,13 +305,14 @@ signed_by(Msg, Authority, Opts) when is_binary(Authority) ->
 %%%-------------------------------------------------------------------
 
 store_set(RefID, Set, Opts) ->
-    {ok, _} = hb_cache:write(Set, Opts),
+    RefOpts = reference_opts(Opts),
+    {ok, _} = hb_cache:write(Set, RefOpts),
     SignedID = hb_message:id(Set, signed, Opts),
     Ts = hb_util:bin(ts_int(hb_maps:get(<<"timestamp">>, Set, 0, Opts))),
     Base = base_path(RefID),
     ok =
         hb_store:link(
-            #{ <<Base/binary, "/sets/", Ts/binary>> => SignedID }, Opts),
+            #{ <<Base/binary, "/sets/", Ts/binary>> => SignedID }, RefOpts),
     update_latest_if_newer(RefID, Set, SignedID, Opts).
 
 update_latest_if_newer(RefID, NewSet, SignedID, Opts) ->
@@ -298,7 +325,7 @@ update_latest_if_newer(RefID, NewSet, SignedID, Opts) ->
             _ -> true
         end,
     case Update of
-        true -> hb_store:link(#{ Latest => SignedID }, Opts);
+        true -> hb_store:link(#{ Latest => SignedID }, reference_opts(Opts));
         _ -> ok
     end.
 
@@ -470,11 +497,12 @@ reference_age(RefID, Opts) ->
 %% @doc Record that the reference was validated against the gateway now.
 mark_refreshed(RefID, Opts) ->
     _ = hb_store:write(
-        #{ refreshed_path(RefID) => hb_util:bin(clock(Opts)) }, Opts),
+        #{ refreshed_path(RefID) => hb_util:bin(clock(Opts)) },
+        reference_opts(Opts)),
     ok.
 
 read_refreshed_at(RefID, Opts) ->
-    case hb_store:read(refreshed_path(RefID), Opts) of
+    case hb_store:read(refreshed_path(RefID), reference_opts(Opts)) of
         {ok, Bin} -> ts_int(Bin);
         _ -> undefined
     end.
@@ -520,11 +548,25 @@ meta_block(Msg, Opts) ->
     ts_int(hb_maps:get(<<"block-height">>, Ref, 0, Opts)).
 
 cache_read(Path, Opts) ->
-    case hb_cache:read(Path, Opts) of
+    case hb_cache:read(Path, reference_opts(Opts)) of
         {ok, _} = Ok -> Ok;
         not_found -> not_found;
         {error, _} = Err -> Err
     end.
+
+reference_opts(Opts) ->
+    case hb_opts:get(<<"reference-store">>, undefined, Opts) of
+        undefined -> Opts;
+        RefStore ->
+            Opts#{
+                <<"store">> =>
+                    normalize_store(RefStore)
+                        ++ normalize_store(hb_opts:get(<<"store">>, [], Opts))
+            }
+    end.
+
+normalize_store(Stores) when is_list(Stores) -> Stores;
+normalize_store(Store) -> [Store].
 
 %%%-------------------------------------------------------------------
 %%% Tests
