@@ -122,12 +122,12 @@ get(Key, Base, Req, Opts) ->
     end.
 
 value_base(ID, Opts) when ?IS_ID(ID) ->
-    case hb_cache:read(ID, Opts) of
+    case hb_cache:read(ID, reference_opts(Opts)) of
         {ok, Msg} -> Msg;
         _ -> ID
     end;
 value_base(Link, Opts) when ?IS_LINK(Link) ->
-    try hb_cache:ensure_loaded(Link, Opts)
+    try hb_cache:ensure_loaded(Link, reference_opts(Opts))
     catch _:_ -> Link
     end;
 value_base(Value, _Opts) ->
@@ -349,17 +349,51 @@ update_latest_if_newer(RefID, NewSet, SignedID, Opts) ->
 %% ordering and pagination.
 fetch_reference_heads(RefID, Authority, MinBlock, Opts) ->
     Query = build_reference_query(Authority, RefID, MinBlock, 100),
-    case hb_client_gateway:query(Query, undefined, Opts) of
+    reference_query_result(
+        hb_client_gateway:query(Query, undefined, Opts),
+        RefID,
+        Opts).
+
+reference_query_result(QueryResult, RefID, Opts) ->
+    case QueryResult of
         {error, Reason} ->
-            ?event(reference,
-                {gateway_error, {ref, RefID}, {reason, Reason}}),
-            {error, Reason};
+            case empty_reference_query_result(Reason, Opts) of
+                true ->
+                    {ok, []};
+                false ->
+                    ?event(reference,
+                        {gateway_error, {ref, RefID}, {reason, Reason}}),
+                    {error, Reason}
+            end;
         {ok, GqlMsg} ->
             Edges =
                 hb_ao:get(
                     <<"data/transactions/edges">>, GqlMsg, [], Opts),
             {ok, edges_to_messages(Edges, Opts)}
     end.
+
+empty_reference_query_result({no_viable_responses, Responses}, Opts) ->
+    Responses =/= []
+        andalso
+            lists:all(
+                fun(Response) -> empty_reference_query_response(Response, Opts) end,
+                Responses);
+empty_reference_query_result(_, _Opts) ->
+    false.
+
+empty_reference_query_response({ok, #{ <<"body">> := Body }}, Opts) ->
+    try
+        [] =
+            hb_ao:get(
+                <<"data/transactions/edges">>,
+                hb_json:decode(Body),
+                Opts),
+        true
+    catch
+        _:_ -> false
+    end;
+empty_reference_query_response(_, _Opts) ->
+    false.
 
 build_reference_query(Authority, RefID, MinBlock, Limit) ->
     OwnerJSON =
