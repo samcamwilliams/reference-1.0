@@ -96,7 +96,11 @@ request(_Base, Req, Opts) ->
         {ok, [Ref | Rest]} ?= hb_maps:find(<<"body">>, Req, Opts),
         true ?= is_map(Ref),
         <<"reference@1.0">> ?= hb_maps:get(<<"device">>, Ref, undefined, Opts),
-        {ok, Value} ?= compute(Ref, #{}, Opts),
+        {ok, Value} ?=
+            case stale(Ref, Req, Opts) of
+                true -> now(Ref, Req, Opts);
+                false -> compute(Ref, Req, Opts)
+            end,
         {ok, Req#{ <<"body">> => [value_base(Value, Opts) | Rest] }}
     else
         _ -> {ok, Req}
@@ -592,10 +596,11 @@ reference_opts(Opts) ->
     case hb_opts:get(<<"reference-store">>, undefined, Opts) of
         undefined -> Opts;
         RefStore ->
-            Opts#{
+            RefOpts = Opts#{ <<"cache-control">> => [<<"always">>] },
+            RefOpts#{
                 <<"store">> =>
                     normalize_store(RefStore)
-                        ++ normalize_store(hb_opts:get(<<"store">>, [], Opts))
+                        ++ normalize_store(hb_opts:get(<<"store">>, [], RefOpts))
             }
     end.
 
