@@ -298,7 +298,8 @@ maybe_apply_item(RefID, Item, State, Opts) ->
 
 signed_by(_Msg, undefined, _Opts) -> false;
 signed_by(Msg, Authority, Opts) when is_binary(Authority) ->
-    lists:member(Authority, hb_message:signers(Msg, Opts)).
+    lists:member(Authority, hb_message:signers(Msg, Opts))
+        andalso hb_message:verify(Msg, Authority, Opts).
 
 %%%-------------------------------------------------------------------
 %%% Cache writes
@@ -349,27 +350,39 @@ update_latest_if_newer(RefID, NewSet, SignedID, Opts) ->
 %% ordering and pagination.
 fetch_reference_heads(RefID, Authority, MinBlock, Opts) ->
     Query = build_reference_query(Authority, RefID, MinBlock, 100),
-    reference_query_result(
-        hb_client_gateway:query(Query, undefined, Opts),
-        RefID,
-        Opts).
+    fetch_reference_heads(RefID, Query, #{}, [], Opts).
 
-reference_query_result(QueryResult, RefID, Opts) ->
-    case QueryResult of
+fetch_reference_heads(RefID, Query, Vars, Pages, Opts) ->
+    case hb_client_gateway:query(Query, Vars, Opts) of
         {error, Reason} ->
             case empty_reference_query_result(Reason, Opts) of
                 true ->
-                    {ok, []};
+                    {ok, lists:append(lists:reverse(Pages))};
                 false ->
                     ?event(reference,
                         {gateway_error, {ref, RefID}, {reason, Reason}}),
                     {error, Reason}
             end;
         {ok, GqlMsg} ->
-            Edges =
-                hb_ao:get(
-                    <<"data/transactions/edges">>, GqlMsg, [], Opts),
-            {ok, edges_to_messages(Edges, Opts)}
+            Tx = hb_util:deep_get(<<"data/transactions">>, GqlMsg, #{}, Opts),
+            Edges = hb_maps:get(<<"edges">>, Tx, [], Opts),
+            Items = edges_to_messages(Edges, Opts),
+            case hb_util:deep_get(<<"pageInfo/hasNextPage">>, Tx, false, Opts) of
+                true ->
+                    case last_cursor(Edges, Opts) of
+                        {ok, Cursor} ->
+                            fetch_reference_heads(
+                                RefID,
+                                Query,
+                                Vars#{ <<"after">> => Cursor },
+                                [Items | Pages],
+                                Opts);
+                        error ->
+                            {error, <<"missing-page-cursor">>}
+                    end;
+                false ->
+                    {ok, lists:append(lists:reverse([Items | Pages]))}
+            end
     end.
 
 empty_reference_query_result({no_viable_responses, Responses}, Opts) ->
@@ -406,11 +419,10 @@ build_reference_query(Authority, RefID, MinBlock, Limit) ->
     LimitBin = integer_to_binary(Limit),
     MinBlockBin = integer_to_binary(MinBlock),
     <<
-        "query { ",
+        "query($after: String) { ",
             "transactions(",
                 "owners: ", OwnerJSON/binary, ", ",
                 "tags: [",
-                    "{ name: \"device\" values: [\"reference@1.0\"] }, ",
                     "{ name: \"reference-id\" values: ",
                         RefIDJSON/binary,
                     " }",
@@ -418,7 +430,9 @@ build_reference_query(Authority, RefID, MinBlock, Limit) ->
                 "block: { min: ", MinBlockBin/binary, " }, ",
                 "sort: HEIGHT_ASC, ",
                 "first: ", LimitBin/binary,
+                ", after: $after",
             "){ ",
+                "pageInfo { hasNextPage } ",
                 "edges { ",
                     "node { ",
                         "id ",
@@ -447,6 +461,10 @@ edges_to_messages(Edges, Opts) ->
     lists:filtermap(
         fun(Edge) -> edge_to_message(Edge, Opts) end,
         Edges).
+
+last_cursor([], _Opts) -> error;
+last_cursor(Edges, Opts) ->
+    hb_maps:find(<<"cursor">>, lists:last(Edges), Opts).
 
 edge_to_message(Edge, Opts) ->
     Node = hb_maps:get(<<"node">>, Edge, #{}, Opts),
@@ -748,6 +766,23 @@ set_from_wrong_authority_is_ignored_test() ->
             Opts),
     ?assertEqual(0, maps:get(last_set_ts, State)),
     ?assertNotMatch({ok, _}, cache_read(latest_path(RefID), Opts)).
+
+tampered_set_from_authority_is_ignored_test() ->
+    Opts = fresh_opts(),
+    Authority = ar_wallet:new(),
+    {RefID, _Init} = build_init(Authority, Opts),
+    Set = build_set(Authority, RefID, 2, #{ <<"x">> => <<"ok">> }, Opts),
+    Tampered = Set#{ <<"reference-value">> => #{ <<"x">> => <<"hax">> } },
+    ?assert(signed_by(Set, addr(Authority), Opts)),
+    ?assertNot(signed_by(Tampered, addr(Authority), Opts)).
+
+reference_query_paginates_without_device_filter_test() ->
+    Query = build_reference_query(<<"AUTH">>, <<"REF">>, 10, 100),
+    ?assertNotEqual(nomatch, binary:match(Query, <<"query($after: String)">>)),
+    ?assertNotEqual(nomatch, binary:match(Query, <<", after: $after">>)),
+    ?assertNotEqual(nomatch, binary:match(Query, <<"pageInfo { hasNextPage }">>)),
+    ?assertEqual(nomatch, binary:match(Query, <<"device">>)),
+    ?assertNotEqual(nomatch, binary:match(Query, <<"reference-id">>)).
 
 %% @doc End-to-end: a `name-resolvers' entry pointing at a reference makes
 %% name lookups read the reference's current value, and updating the
