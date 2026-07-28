@@ -82,7 +82,8 @@ compute(Base, _Req, Opts) ->
 %% them into local state in Arweave order, and then resolving the result via
 %% `compute/3'.
 now(Base, Req, Opts) ->
-    case refresh(Base, Opts) of
+    RefID = reference_id(Base, Opts),
+    case coalesced_refresh(RefID, fun() -> refresh(Base, Opts) end, Opts) of
         ok -> compute(Base, Req, Opts);
         {error, _} = Err -> Err
     end.
@@ -92,13 +93,8 @@ now(Base, Req, Opts) ->
 request(_Base, Req, Opts) ->
     maybe
         {ok, [Ref | Rest]} ?= hb_maps:find(<<"body">>, Req, Opts),
-        true ?= is_map(Ref),
         <<"reference@1.0">> ?= hb_maps:get(<<"device">>, Ref, undefined, Opts),
-        {ok, Value} ?=
-            case stale(Ref, Req, Opts) of
-                true -> now(Ref, Req, Opts);
-                false -> compute(Ref, Req, Opts)
-            end,
+        {ok, Value} ?= compute(Ref, #{}, Opts),
         {ok, Req#{ <<"body">> => [value_base(Value, Opts) | Rest] }}
     else
         _ -> {ok, Req}
@@ -203,11 +199,63 @@ refresh(Base, Opts) ->
             case fetch_reference_heads(RefID, Authority, MinBlock, Opts) of
                 {ok, Items} ->
                     apply_items(RefID, Authority, Items, Opts),
-                    ok = mark_refreshed(RefID, Opts),
                     ok;
                 {error, _} = Err -> Err
             end
     end.
+
+%% @doc Run at most one concurrent refresh for a reference. `hb_name:singleton'
+%% atomically starts or returns the worker for this RefID. The worker performs
+%% one refresh and fans its outcome out to every caller that joined it.
+coalesced_refresh(RefID, Refresh, Opts) ->
+    Name = {?MODULE, refresh, RefID},
+    Worker =
+        hb_name:singleton(
+            Name,
+            fun() -> refresh_singleton(Name, RefID, Refresh, Opts) end),
+    RequestRef = make_ref(),
+    MonitorRef = erlang:monitor(process, Worker),
+    Worker ! {refresh_result, self(), RequestRef},
+    receive
+        {refresh_result, RequestRef, Outcome} ->
+            erlang:demonitor(MonitorRef, [flush]),
+            refresh_outcome(Outcome);
+        {'DOWN', MonitorRef, process, Worker, normal} ->
+            coalesced_refresh(RefID, Refresh, Opts);
+        {'DOWN', MonitorRef, process, Worker, Reason} ->
+            exit(Reason)
+    end.
+
+refresh_singleton(Name, RefID, Refresh, Opts) ->
+    receive
+        {refresh_result, From, RequestRef} ->
+            Outcome =
+                try Refresh() of
+                    Result ->
+                        case Result of
+                            ok -> ok = mark_refreshed(RefID, Opts);
+                            {error, _} -> ok
+                        end,
+                        {return, Result}
+                catch
+                    Class:Reason:Stack -> {raise, Class, Reason, Stack}
+                end,
+            From ! {refresh_result, RequestRef, Outcome},
+            reply_refresh_waiters(Name, Outcome)
+    end.
+
+reply_refresh_waiters(Name, Outcome) ->
+    receive
+        {refresh_result, From, RequestRef} ->
+            From ! {refresh_result, RequestRef, Outcome},
+            reply_refresh_waiters(Name, Outcome)
+    after 0 ->
+        hb_name:unregister(Name)
+    end.
+
+refresh_outcome({return, Result}) -> Result;
+refresh_outcome({raise, Class, Reason, Stack}) ->
+    erlang:raise(Class, Reason, Stack).
 
 %% @doc Persist the init message under its canonical path so subsequent
 %% lookups can locate it.
@@ -1155,5 +1203,41 @@ reference_max_age_serves_cache_without_gateway_test() ->
         {ok, 42},
         get(<<"x">>, Init, #{ <<"max-age">> => 60 },
             OptsW#{ <<"reference-clock">> => 150 })).
+
+%% @doc Concurrent refreshes of the same reference share one in-flight
+%% attempt. A later, non-overlapping refresh remains an explicit revalidation.
+coalesced_refresh_single_flight_test() ->
+    Opts = fresh_opts(),
+    RefID = crypto:strong_rand_bytes(32),
+    Parent = self(),
+    Calls = atomics:new(1, []),
+    Refresh =
+        fun() ->
+            _ = atomics:add_get(Calls, 1, 1),
+            timer:sleep(100),
+            ok
+        end,
+    Workers =
+        [
+            spawn(fun() ->
+                receive go -> ok end,
+                Result = coalesced_refresh(RefID, Refresh, Opts),
+                Parent ! {refresh_result, self(), Result}
+            end)
+        || _ <- lists:seq(1, 10)
+        ],
+    lists:foreach(fun(Pid) -> Pid ! go end, Workers),
+    lists:foreach(
+        fun(Pid) ->
+            receive
+                {refresh_result, Pid, Result} -> ?assertEqual(ok, Result)
+            after 5000 ->
+                ?assert(false)
+            end
+        end,
+        Workers),
+    ?assertEqual(1, atomics:get(Calls, 1)),
+    ?assertEqual(ok, coalesced_refresh(RefID, Refresh, Opts)),
+    ?assertEqual(2, atomics:get(Calls, 1)).
 
 -endif.
