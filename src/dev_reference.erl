@@ -162,16 +162,42 @@ current_message(Base, Opts) ->
         _ -> init_message(Base, RefID, Opts)
     end.
 
-%% @doc Return the `init' message for the reference. If `Base' is itself
-%% the init we return it directly; otherwise we look it up in the local
-%% cache.
+%% @doc Return the canonical `init' message for the reference: the init
+%% identified by `RefID'. A caller-supplied base is used only when it
+%% authenticates as that init (see `authentic_init/3'); otherwise the
+%% cached canonical init is used.
 init_message(Base, RefID, Opts) ->
-    case is_init(Base, Opts) of
+    case is_init(Base, Opts) andalso authentic_init(Base, RefID, Opts) of
         true -> Base;
-        false ->
-            case cache_read(init_path(RefID), Opts) of
-                {ok, Init} -> Init;
+        false -> cached_init(RefID, Opts)
+    end.
+
+%% @doc Read the canonical init from the local cache: the canonical link
+%% path first, then the reference ID itself.
+cached_init(RefID, Opts) ->
+    case cache_read(init_path(RefID), Opts) of
+        {ok, Init} -> Init;
+        _ ->
+            case cache_read(RefID, Opts) of
+                {ok, Init} when is_map(Init) ->
+                    case authentic_init(Init, RefID, Opts) of
+                        true -> Init;
+                        false -> undefined
+                    end;
                 _ -> undefined
+            end
+    end.
+
+%% @doc Does `Base' authenticate as the init for `RefID'? Its signed
+%% identity must be the reference ID and, when it carries commitments, they
+%% must verify. An unsigned init authenticates by identity alone.
+authentic_init(Base, RefID, Opts) ->
+    case hb_message:id(Base, signed, Opts) =:= RefID of
+        false -> false;
+        true ->
+            case hb_message:signers(Base, Opts) of
+                [] -> true;
+                _ -> hb_message:verify(Base, all, Opts)
             end
     end.
 
@@ -210,12 +236,13 @@ refresh(Base, Opts) ->
     end.
 
 %% @doc Persist the init message under its canonical path so subsequent
-%% lookups can locate it.
+%% lookups can locate it. Only an init that authenticates for `RefID'
+%% (see `authentic_init/3') is written.
 ensure_init_cached(Base, RefID, Opts) ->
     case cache_read(init_path(RefID), Opts) of
         {ok, _} -> ok;
         _ ->
-            case is_init(Base, Opts) of
+            case is_init(Base, Opts) andalso authentic_init(Base, RefID, Opts) of
                 true ->
                     RefOpts = reference_opts(Opts),
                     {ok, _} = hb_cache:write(Base, RefOpts),
